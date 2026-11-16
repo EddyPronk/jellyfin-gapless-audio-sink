@@ -616,6 +616,15 @@ class Settings(SettingsBase):
     # as ordinary PCM and a receiver plays it as static. Reaching the device
     # directly is the only way, and picking it needs a control.
     audio_device: Optional[str] = None
+    # The native audio sink (sink_player / native_audio), which plays FLAC
+    # without mpv. Its output goes through PortAudio, not mpv, so the device
+    # is named the way sounddevice lists it ("Schiit Modi+", "hw:1,0") and
+    # audio_device above does not apply. None is the system default.
+    sink_device: Optional[str] = None
+    # Tracks up to this size are held in memory, fetched ahead of time and
+    # joined gaplessly; bigger ones are streamed as they play and may have a
+    # gap before them. Two tracks can be in memory at once.
+    sink_ram_limit_mb: int = 100
     # Take the device exclusively, so nothing else can mix into it (and
     # nothing resamples or attenuates a bitstream on the way out). mpv only
     # honours this on wasapi, coreaudio and sndio -- not ALSA -- so the
