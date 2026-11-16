@@ -32,12 +32,14 @@ sample-exact. That is the whole trick: gapless stops being a player feature and 
 "don't stop writing".
 
 ```
-queue (Media) ──> TrackFetcher ──> cache file ──> FLAC decoder ──> PCM ring ──> ALSA
-                  current + next    on disk         per track        one stream
+queue (Media) ──> TrackFetcher ──> memory ──> FLAC decoder ──> PCM ring ──> ALSA
+                  current + next   or stream     per track        one stream
 ```
 
-- **TrackFetcher** downloads the current track and, as soon as that finishes, the next one.
-- **Decoder** reads the cache file, blocking when it catches up with a download in progress,
+- **TrackFetcher** downloads the current track into memory and, as soon as that finishes,
+  the next one. Tracks over a size limit are streamed instead (see "Memory, and no disk
+  cache").
+- **Decoder** reads those bytes, blocking when it catches up with a download in progress,
   so the first track starts before it has fully arrived.
 - **Output** is one stream opened at the first track's sample rate, bit depth and channel
   count. When a track's decoder runs dry, the next track's decoder takes over in the same
@@ -45,8 +47,8 @@ queue (Media) ──> TrackFetcher ──> cache file ──> FLAC decoder ─�
 - If the next track's format differs, drain, reopen the device and accept a gap. Tracks of
   one album normally match.
 
-Caching whole files makes seeking a local operation and removes the network from the
-track boundary entirely.
+Holding a whole track in memory makes seeking a local operation and removes the network
+from the track boundary entirely. A streamed track gives both of those up.
 
 ## Libraries
 
@@ -209,7 +211,7 @@ To listen to two whole tracks: `venv/bin/python play_gapless.py URL1 URL2 --devi
 
 | Module | What it does |
 |---|---|
-| `fetcher.py` | `HttpSource` downloads to a cache file on its own thread; the file can be read (and seeked) while it is still arriving. `LocalSource` for files on disk. |
+| `fetcher.py` | `HttpSource` holds a track in memory or streams it, by size (see below); either way it can be read while still arriving. `LocalSource` for files on disk. |
 | `decoder.py` | libsndfile to PCM blocks. 16-bit stays `int16`, 24-bit goes out as `int32`. |
 | `output.py` | One PortAudio stream: 1 s device buffer, 4096-frame blocks, dither off, retries while the device is busy. |
 | `engine.py` | `GaplessPlayer`: decodes track after track into the same stream. Play, pause, seek, stop, volume, mute, position; asks a `next_track` callback what follows; reopens the stream only when the sample format changes. |
@@ -217,15 +219,47 @@ To listen to two whole tracks: `venv/bin/python play_gapless.py URL1 URL2 --devi
 
 The libraries are the optional `sink` extra in `pyproject.toml`.
 
-Tests: `tests/test_native_audio.py`, 11 tests, real code throughout with only the sound
+Tests: `tests/test_native_audio.py`, 13 tests, real code throughout with only the sound
 card faked. They cover the sample-exact join (local and over HTTP, 16 and 24 bit), a
 format change, start offsets, seek, volume, mute, a queue change before the join, a
-failed download, and reading ahead of the download. They pass on the desktop and on the
+failed download, reading ahead of the download, and streaming (including a seek). They pass on the desktop and on the
 Pi, and skip where numpy/soundfile are missing (as with the system Python here).
 
 On the Pi through the Modi+, using the command-line player on the two real tracks (last
 10 s of track 1 into the first 10 s of track 2, -20 dB): **6 of 6 runs bit-perfect across
-the join**, 0 underruns, 0 device status flags, download cache empty afterwards.
+the join**, 0 underruns, 0 device status flags.
+
+### Memory, and no disk cache (changed 2026-11-16)
+
+Nothing is written to disk. A track from the server is handled by its size:
+
+| Track size | What happens | Join into it |
+|---|---|---|
+| Up to the limit (default 100 MB, about 15 minutes of CD-quality FLAC) | Downloaded whole into memory, ahead of time, while the previous track plays. | Gapless. |
+| Over the limit | Streamed: read from the server as it is decoded, through a window of about 2 MB; seeks are HTTP range requests. Not fetched ahead. | May have a gap if the server is slow to answer. |
+
+The limit is `ram_limit` on `HttpSource` and `--ram-limit-mb` on the command-line player.
+It becomes a `conf.json` setting when sink mode is wired into the app (step 4). Two tracks
+can be in memory at once (playing and next), so the worst case is twice the limit; on the
+415 MB Pi that argues against raising it much.
+
+Measured on the Pi through the Modi+, the same two real tracks (12.6 MB and 26.4 MB), three
+runs at each setting, all nine bit-perfect across the join with no underruns:
+
+| `--ram-limit-mb` | Mode | Peak process memory |
+|---|---|---|
+| 100 | both in memory | 87 MB |
+| 20 | track 2 streamed | 63 MB |
+| 5 | both streamed | 52 MB |
+
+So on this LAN a streamed track also joined without a gap; the gap is a risk on a slow or
+busy server, not something observed. The decoder opens the next track about four seconds
+before it is heard (three seconds of decoded audio plus the one-second device buffer), which
+is the time a streamed track has to answer.
+
+An earlier version cached every track to a disk file. With two generated 40-minute tracks
+(311 MB each) that held memory flat but wrote 623 MB to disk, which on the Pi means SD-card
+wear, or failure if the cache is the RAM-backed `/tmp`. It was replaced by the above.
 
 Known limits of the package as it stands:
 
@@ -237,13 +271,16 @@ Known limits of the package as it stands:
 - **Pause keeps the DAC open**, so other players on the Pi cannot use it meanwhile.
 - **One download at a time.** The next track starts downloading when the current one has
   fully arrived. Skipping to a track that was not prefetched waits for its header.
+- **A streamed track depends on the network throughout.** A stall longer than about four
+  seconds is heard as silence; one dropped connection is resumed, a second fails the track.
 - **Not exercised on real hardware:** 24-bit and high-rate files, a format change, the
   busy-device retry, pause/seek/volume by ear, and whole albums.
 
 ## Risks
 
-- **Cache size.** A 20-minute 24-bit/96 kHz track is several hundred MB. Cache to disk, keep
-  only current and next, and avoid a RAM-backed `/tmp` on a small Pi.
+- **Memory.** Up to two tracks are held in RAM, each up to the configured limit. Larger
+  tracks are streamed and may gap at the join. A 20-minute 24-bit/96 kHz track is several
+  hundred MB and will always be streamed on the Pi.
 - **Slow links.** If the next track has not started downloading in time there is a gap
   anyway; the output must write silence rather than stall or close.
 - **Server-side transcodes.** If the server decides to transcode a FLAC (bitrate limit,
