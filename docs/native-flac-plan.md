@@ -444,6 +444,47 @@ A caution for anyone repeating the test: an app version that does not know a set
 it from `conf.json` when it saves. The first attempt ran old code against the scratch
 config and silently removed `audio_sink` from it.
 
+## First full-album run, and a dropout (2026-11-16)
+
+The Pi's service was switched to `audio_sink: true` and a whole album cast to it
+(`sink_ram_limit_mb` 40, device `Schiit Modi+`, volume 100).
+
+Memory, sampled every 30 s:
+
+| Time | Process | System available | What changed |
+|---|---|---|---|
+| 18:29 | 96 MB | 206 MB | tracks 1 and 2 in RAM |
+| 18:30 | 99 MB (peak 110) | 203 MB | track 3 fetched as track 2 began |
+| 18:34 | 74 MB | 230 MB | track 4 is 44 MB, over the limit: streamed, not held |
+| 18:36 | 87 MB | 222 MB | track 5 fetched ahead while track 4 streams |
+
+About 60 MB is the app; the rest is whatever tracks are held. Memory went down as well as
+up, with no sign of a leak. CPU was about 6% of one core. The brief peak of 110 MB is three
+tracks overlapping at a change: the one ending, the one starting, and the next arriving.
+
+**The dropout.** Audio dropped out briefly at about 18:41, during the streamed track, and
+recovered by itself. `apt-daily.service` ran from 18:40:40 to 18:40:50, and in the same
+half-minute 35 MB of the sink process went to swap (system swap 39 MB to 88 MB). Swap on
+that Pi is a file on the SD card. The app log had no errors, and no way to say whether
+the audio thread had waited on swap or the stream had stalled on the network: nothing
+logged dropouts.
+
+Changed in response (`5f5972ee`):
+
+- **Dropouts are logged**, with the track name: silence written because no audio was
+  ready, and device underflows. Checked on each timeline tick.
+- **Stream stalls are logged**: a read of a streamed track that takes over a second.
+- **`lock_memory()`**: in sink mode the process calls `mlockall` (current, future,
+  on-fault) so it cannot be swapped out. Only when `RLIMIT_MEMLOCK` is unlimited, which
+  needs `LimitMEMLOCK=infinity` in the service unit; under a limit it logs how to enable
+  it and carries on. The Pi's unit has that as a drop-in since 2026-11-17.
+
+Not yet shown: that locking prevents the dropout. It removes the swap explanation; the
+next occurrence, if there is one, will be attributable from the log.
+
+One batch of 10 test runs made while writing this had 2 failures whose output was not
+captured. 109 further runs passed. Unexplained.
+
 ## Risks
 
 - **Memory.** Up to two tracks are held in RAM, each up to the configured limit. Larger
