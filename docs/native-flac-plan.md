@@ -97,7 +97,7 @@ not import `python-mpv` at all, so the Pi needs no mpv installed.
    description: Split what the sink needs out of
    `Video.get_playback_url` so the next track's URL and headers can be resolved while the
    current one plays, without `terminate_transcode()` or disturbing the current play session.
-4. **`AudioSinkManager`.** Owns the queue position, drives fetcher/decoder/output, and
+4. **`AudioSinkManager`.** Done, see "Step 4 results". Original description: Owns the queue position, drives fetcher/decoder/output, and
    advances `Media` when the output crosses a track boundary (not when a download ends).
 5. **Server reporting.** At each boundary: stopped report for the old item, played mark,
    start report for the new one; progress on the existing timeline tick. `ReportingMixin`
@@ -310,6 +310,46 @@ virtualenv on the Pi (`~/jellyfin/.venv`), ready for sink mode.
 Left for step 4: `Media.get_next()` builds a new Video (one `get_item` request) every time
 it is called, and the engine asks for the next track twice and expects the same object, so
 the sink manager has to cache what it resolved.
+
+## Step 4 results (2026-11-16)
+
+`jellyfin_mpv_shim/sink_player.py`: `AudioSinkManager`, with the method names the event
+handler and timeline thread already call on the mpv player, driving the native engine. It
+does not import mpv. Nothing selects it yet (step 6), and it reports nothing to the server
+yet (step 5): `_report_started`, `_report_stopped` and `send_timeline` are empty hooks.
+
+- **Cast commands covered:** play (with a start offset), stop, pause/unpause/toggle, seek
+  (absolute and relative), next, previous, skip-to, volume, mute, and "play next / play
+  last" queue inserts.
+- **Gapless advance:** the engine moves to the next track on its own; when that track is
+  handed to the device, the manager's current item moves with it. No `play()` call happens
+  at a track boundary.
+- **The next item is cached.** `Media.get_next()` is called once per boundary, not once
+  per question from the engine. Pressing next reuses the track already fetched ahead.
+- **Queue edits** clear the cache and tell the engine, so an item queued "next" is what
+  plays next.
+- **What cannot be played is refused.** A cast of a non-FLAC item is declined and logged
+  and the current track carries on. A queue stops after the last playable track before one
+  that cannot be played. Skipping to an unplayable item ends in silence, not the old track.
+- **A stop is only reported for an item that was reported started.** An item paused or
+  skipped before any of it was heard is never announced.
+- **Not supported:** SyncPlay (declined), repeat, shuffle, and everything that needs a
+  screen (menus, fullscreen, screenshots, track selection), which are accepted and ignored.
+
+Two settings, in `conf.py` and `docs/configuration.md`: `sink_device` (the output device as
+PortAudio names it) and `sink_ram_limit_mb` (default 100).
+
+Tests: `tests/test_sink_player.py`, 17 tests with the real engine, a fake sound card and a
+stand-in queue that, like the real one, builds a new Video on every `get_next()`.
+
+Checked on the Pi with the real `Media`/`Video` classes, the stored login, the real server
+and the Modi+: a two-track queue started 10 s before the end of track 1. The current item
+moved to track 2 at the join, with no underruns or device status flags, and what reached the
+DAC was bit-exact across the join. A pause, unpause and position read during track 2 behaved.
+The running service was not touched.
+
+Seen in that run and relevant to step 5: "started" is reported about 1.2 s before the track
+is heard (the device buffer plus PortAudio's lead-in).
 
 ## Risks
 

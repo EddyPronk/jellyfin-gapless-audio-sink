@@ -612,6 +612,22 @@ On Windows the bundled mpv cannot run SVP. Install an mpv build with
 [VapourSynth](https://github.com/shinchiro/mpv-winbuild-cmake/wiki/Setup-vapoursynth-for-mpv),
 then set `mpv_ext` and `mpv_ext_path` to use it.
 
+### Native audio sink
+
+Gapless FLAC playback without mpv, for a machine that is only an audio output. The switch
+that turns it on is not in the app yet; these two settings are read by it. See
+[native-flac-plan.md](native-flac-plan.md).
+
+- `sink_device` - The output device, as PortAudio names it (for example `Schiit Modi+`, or
+  `hw:1,0`). Default: `null` (the system default). `audio_device` is mpv's and does not apply.
+  - `python3 -m sounddevice` lists the names.
+- `sink_ram_limit_mb` - Tracks up to this size are downloaded into memory ahead of time and
+  joined gaplessly. Default: `100` (about 15 minutes of CD-quality FLAC)
+  - Bigger tracks are streamed as they play, never held whole, and may have a gap before
+    them if the server is slow to answer.
+  - Two tracks can be in memory at once, so allow for twice this. On a machine with little
+    RAM, lower it.
+
 ### External mpv
 
 Drive a separate mpv process instead of the bundled library — for a distribution that ships
