@@ -93,7 +93,8 @@ not import `python-mpv` at all, so the Pi needs no mpv installed.
    pause, position counted in frames written). Unit-testable without a server: feed it local
    FLAC files and capture output into a buffer; assert the PCM equals the two files
    concatenated.
-3. **URL resolution without side effects.** Split what the sink needs out of
+3. **URL resolution without side effects.** Done, see "Step 3 results". Original
+   description: Split what the sink needs out of
    `Video.get_playback_url` so the next track's URL and headers can be resolved while the
    current one plays, without `terminate_transcode()` or disturbing the current play session.
 4. **`AudioSinkManager`.** Owns the queue position, drives fetcher/decoder/output, and
@@ -275,6 +276,40 @@ Known limits of the package as it stands:
   seconds is heard as silence; one dropped connection is resumed, a second fails the track.
 - **Not exercised on real hardware:** 24-bit and high-rate files, a format change, the
   busy-device retry, pause/seek/volume by ear, and whole albums.
+
+## Step 3 results (2026-11-16)
+
+`jellyfin_mpv_shim/sink_source.py`: `native_track(video, ram_limit)` runs the app's normal
+negotiation (`Video.get_playback_url`) for a queue item and returns a `native_audio` Track,
+or raises `NotNative` with the reason.
+
+- **No split of `get_playback_url` was needed.** The plan feared it would disturb the
+  current play session. It does not: `terminate_transcode()` and everything else in it act
+  on the Video it is called on, and each call gets its own `PlaySessionId`. Resolving the
+  next track early leaves the playing one untouched.
+- **What it accepts:** audio items the server hands over unmodified as FLAC. A transcode,
+  another container, a non-audio item or an item with no source raises `NotNative`.
+- **The token goes in a header**, per request, and only to the server's own origin. The URL
+  carries no key, so it cannot end up in a log. A file on another host (an http source, a
+  path substitution) is sent no credential.
+- **A direct path** on the local machine becomes a `LocalSource`.
+
+Tests: `tests/test_sink_source.py`, 7 tests against a stand-in Video.
+
+Checked on the Pi against the real server with the real `Media` and `Video` classes and
+the app's stored login (an HTTP-only client; the running service was not touched). For the
+two test tracks: `DirectPlay`, not a transcode, container `flac`, URL
+`/Videos/<id>/stream` with no token in it, `Authorization` header present, and each opened
+and decoded over HTTP (44.1 kHz, 16-bit). Resolving the second left the first's play
+session, source and URL unchanged. That endpoint also answers range requests, which the
+streaming mode needs.
+
+The audio libraries (numpy, soundfile, sounddevice) are now installed in the app's
+virtualenv on the Pi (`~/jellyfin/.venv`), ready for sink mode.
+
+Left for step 4: `Media.get_next()` builds a new Video (one `get_item` request) every time
+it is called, and the engine asks for the next track twice and expects the same object, so
+the sink manager has to cache what it resolved.
 
 ## Risks
 
