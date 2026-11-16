@@ -92,6 +92,26 @@ QUICK_CONNECT_TIMEOUT_SECS = 300
 VERIFY_RETRY_WINDOW_SECS = 600
 
 
+#: What the audio sink can act on: transport, volume and the queue.
+SINK_COMMANDS = ("VolumeUp", "VolumeDown", "ToggleMute", "Mute", "Unmute",
+                 "SetVolume", "Play", "Playstate", "PlayNext")
+
+
+def capabilities():
+    """What this client tells the server it can do.
+
+    As an audio sink it plays audio and has no screen, so it does not offer
+    itself for video, photos, navigation or "show me this".
+    """
+    if not settings.audio_sink:
+        return CAPABILITIES
+    caps = dict(CAPABILITIES)
+    caps["PlayableMediaTypes"] = ["Audio"]
+    caps["SupportedCommands"] = [c for c in CAPABILITIES["SupportedCommands"]
+                                 if c in SINK_COMMANDS]
+    return caps
+
+
 class QuickConnectError(Exception):
     """Raised when a Quick Connect login cannot be completed.
 
@@ -1040,7 +1060,7 @@ class ClientManager(object):
                     if self.is_stopping:
                         break
                     try:
-                        client.jellyfin.post_capabilities(CAPABILITIES)
+                        client.jellyfin.post_capabilities(capabilities())
                         break
                     except Exception:
                         if i == 5:

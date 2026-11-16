@@ -1,7 +1,7 @@
 import logging
 import threading
 
-from .player import playerManager
+from .player_select import playerManager
 
 log = logging.getLogger("action_thread")
 

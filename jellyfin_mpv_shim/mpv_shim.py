@@ -250,7 +250,11 @@ def main():
 
     user_interface = None
     use_gui = False
-    if settings.enable_gui:
+    if settings.audio_sink:
+        # An audio output and nothing else: no window, no library, and no
+        # mpv -- player_select hands out the native sink instead.
+        log.info("Audio sink mode: playing FLAC natively, without mpv.")
+    elif settings.enable_gui:
         try:
             # The browser rasterizes tiles with Pillow; probe it here so a
             # missing optional dep degrades to the CLI with one clear
@@ -299,7 +303,7 @@ def main():
         from .cli_mgr import user_interface
 
     from .clients import clientManager
-    from .player import playerManager
+    from .player_select import playerManager
     from .action_thread import actionThread
     from .event_handler import eventHandler
     from .timeline import timelineManager
@@ -315,7 +319,7 @@ def main():
     playerManager.action_trigger = actionThread.trigger
     # mpv failing to re-create quits the app, in every UI mode.
     playerManager.on_reopen_failed = lambda _error: halt.set()
-    if settings.mpris:
+    if settings.mpris and not settings.audio_sink:
         from . import mpris
 
         mpris.start(playerManager)
@@ -398,9 +402,10 @@ def main():
         # Covers the quit paths that do not start at a window close (tray
         # Quit, Ctrl-C): mpv is about to go away either way, and no reply
         # is worth minutes now.
-        from .player import bound_ipc_replies
+        if not settings.audio_sink:
+            from .player import bound_ipc_replies
 
-        bound_ipc_replies()
+            bound_ipc_replies()
         # Logged per step for the same reason — the last line in the log
         # names the step that hung, even if the dump is unavailable.
         for name, stop in (

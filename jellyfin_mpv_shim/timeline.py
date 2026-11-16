@@ -5,7 +5,7 @@ import os
 import jellyfin_apiclient_python.exceptions
 
 from .conf import settings
-from .player import playerManager, _mpv_errors
+from .player_select import playerManager, _mpv_errors
 from .utils import Timer
 
 log = logging.getLogger("timeline")

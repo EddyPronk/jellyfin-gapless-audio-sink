@@ -616,8 +616,11 @@ class Settings(SettingsBase):
     # as ordinary PCM and a receiver plays it as static. Reaching the device
     # directly is the only way, and picking it needs a control.
     audio_device: Optional[str] = None
-    # The native audio sink (sink_player / native_audio), which plays FLAC
-    # without mpv. Its output goes through PortAudio, not mpv, so the device
+    # Run as an audio output only: cast commands drive the native audio
+    # sink (sink_player / native_audio), which plays FLAC gaplessly, and mpv
+    # is never loaded. No window and no library, whatever enable_gui says.
+    audio_sink: bool = False
+    # The sink's output goes through PortAudio, not mpv, so the device
     # is named the way sounddevice lists it ("Schiit Modi+", "hw:1,0") and
     # audio_device above does not apply. None is the system default.
     sink_device: Optional[str] = None
