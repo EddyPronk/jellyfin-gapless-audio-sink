@@ -38,6 +38,43 @@ from .sink_source import NotNative, native_track
 
 TICKS = 10000000                            # Jellyfin's ticks per second
 
+
+def lock_memory():
+    """Keep this process's memory out of swap. True if it is now locked.
+
+    On a small machine, another program wanting memory (a nightly apt run,
+    say) pushes this one's pages out to swap, and on a Raspberry Pi swap is
+    the SD card: the audio thread then waits on the card for its own code,
+    which is heard as a dropout. Locked pages are never swapped.
+
+    Only done when the process is allowed to lock without limit
+    (``LimitMEMLOCK=infinity`` in the systemd unit): under a limit, locking
+    future allocations would make them fail once the limit was reached.
+    """
+    try:
+        import ctypes
+        import resource
+
+        soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        if soft != resource.RLIM_INFINITY:
+            log.info("Memory is not locked (the limit is %d MB); audio may "
+                     "drop out if the system swaps. Set LimitMEMLOCK=infinity "
+                     "in the service unit to lock it.", soft >> 20)
+            return False
+        libc = ctypes.CDLL(None, use_errno=True)
+        # MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT: lock what is in use and
+        # whatever gets used later, without pre-faulting every thread's
+        # whole stack.
+        if libc.mlockall(1 | 2 | 4) != 0:
+            log.warning("Could not lock memory (errno %d); audio may drop "
+                        "out if the system swaps.", ctypes.get_errno())
+            return False
+        log.info("Memory locked: this process will not be swapped out.")
+        return True
+    except Exception:
+        log.debug("could not lock memory", exc_info=True)
+        return False
+
 log = logging.getLogger("sink_player")
 
 
@@ -79,6 +116,7 @@ class AudioSinkManager:
         #: reports wait for it, so one cannot arrive before the start.
         self._session_ready = threading.Event()
         self._progress_lock = threading.Lock()
+        self._dropouts_seen = (0, 0)        # underrun frames, device flags
         self._start_time = time.time()
         self._last_position = 0.0
         self._start_offset = 0.0            # where the last play() began
@@ -480,6 +518,7 @@ class AudioSinkManager:
         # thread it wakes); without this a report built just BEFORE the
         # pause could reach the server after the one built after it, and
         # the server would show "playing" until the next tick.
+        self._log_dropouts()
         with self._progress_lock:
             with self._lock:
                 video = self._video
@@ -492,6 +531,29 @@ class AudioSinkManager:
                           options["PositionTicks"] / TICKS,
                           options["IsPaused"], options["VolumeLevel"])
                 video.client.jellyfin.session_progress(options)
+
+    def _log_dropouts(self):
+        """Say so when audio has dropped out since the last look.
+
+        Two kinds: the decoder had nothing ready, so silence was written
+        (a slow network on a streamed track, or this process waiting on
+        swap); or the device itself reported running dry (the audio thread
+        was late).
+        """
+        engine = self._engine
+        frames, flags = engine.underrun_frames, engine.status_flags
+        was_frames, was_flags = self._dropouts_seen
+        if (frames, flags) == (was_frames, was_flags):
+            return
+        self._dropouts_seen = (frames, flags)
+        track = engine.current
+        rate = (track.rate if track is not None else None) or 44100
+        video = self._video
+        name = (getattr(video, "item", None) or {}).get("Name", "?")
+        log.warning(
+            "Audio dropout during %s: %.0f ms of silence written because "
+            "no audio was ready, %d device underflow(s).", name,
+            1000.0 * (frames - was_frames) / rate, flags - was_flags)
 
     # -- parts of the mpv player's surface that mean nothing without a screen -
 

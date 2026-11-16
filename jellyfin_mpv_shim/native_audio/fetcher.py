@@ -16,6 +16,7 @@ import io
 import logging
 import os
 import threading
+import time
 
 log = logging.getLogger("native_audio.fetcher")
 
@@ -28,6 +29,8 @@ DEFAULT_RAM_LIMIT = 100 << 20
 #: land before reading on is cheaper than a new request.
 _KEEP_BEHIND = 1 << 20
 _SKIP_AHEAD = 256 << 10
+#: A read of a streamed track that takes longer than this is logged.
+_STALL_SECONDS = 1.0
 
 
 class FetchError(IOError):
@@ -318,12 +321,19 @@ class _StreamReader(_Reader):
         want = min(len(b), src.total - self._pos)
         if want <= 0:
             return 0
+        began = time.monotonic()
         try:
             end = self._base + len(self._buf)
             if self._resp is None or self._pos < self._base \
                     or self._pos > end + _SKIP_AHEAD:
                 self._connect(self._pos)
             self._fill(self._pos + want)
+            waited = time.monotonic() - began
+            if waited > _STALL_SECONDS:
+                # The player holds about four seconds of audio; a wait this
+                # long is on its way to being heard.
+                log.warning("The stream of %s stalled for %.1fs.",
+                            src.label, waited)
         except Exception as e:
             # Raising here would only be swallowed by libsndfile's callback;
             # the engine looks at source.error when the decoder stops.
