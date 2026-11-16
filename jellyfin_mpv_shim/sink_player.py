@@ -481,6 +481,9 @@ class AudioSinkManager:
                 return
             options = self._options(video, self._position_of(video))
         if options is not None:
+            log.debug("progress: %.1fs paused=%s volume=%s",
+                      options["PositionTicks"] / TICKS, options["IsPaused"],
+                      options["VolumeLevel"])
             video.client.jellyfin.session_progress(options)
 
     # -- parts of the mpv player's surface that mean nothing without a screen -
