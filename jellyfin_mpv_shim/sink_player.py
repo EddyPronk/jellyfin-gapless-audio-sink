@@ -20,15 +20,23 @@ What it does on top of the engine is keep the app's queue (``Media`` /
 Only FLAC that the server hands over unmodified can be played. Anything else
 is refused and logged, and a queue stops at the first such track.
 
-Not here yet: reporting to the server (``_report_*`` and ``send_timeline``
-are hooks for it), SyncPlay, repeat and shuffle.
+The server is told what is playing through the same three reports the mpv
+player sends -- playing, progress, stopped -- on the same ordered queue
+(``SessionReporter``), so a stop can never overtake the start that follows
+it and no report holds up the audio.
+
+Not here: SyncPlay, repeat and shuffle.
 """
 import logging
 import threading
+import time
 
 from .conf import settings
 from .native_audio.engine import GaplessPlayer
+from .session_reporter import SessionReporter
 from .sink_source import NotNative, native_track
+
+TICKS = 10000000                            # Jellyfin's ticks per second
 
 log = logging.getLogger("sink_player")
 
@@ -66,6 +74,13 @@ class AudioSinkManager:
         self._next = {}
         self._track = None                  # the engine's track for _video
         self._announced = None              # the Video reported as started
+        self._reporter = SessionReporter("sink-report")
+        #: Set once the server has been told playback started; progress
+        #: reports wait for it, so one cannot arrive before the start.
+        self._session_ready = threading.Event()
+        self._start_time = time.time()
+        self._last_position = 0.0
+        self._start_offset = 0.0            # where the last play() began
         self.syncplay = _NoSyncPlay()
         self.menu = _NoMenu()
         # Set by the app once its threads exist; poked when state changes.
@@ -130,6 +145,7 @@ class AudioSinkManager:
                 self._stopped(previous, finished=False)
             self._video, self._track = video, track
             self._next = {}
+            self._start_offset = max(0.0, offset or 0)
             self._engine.play(track, offset or 0)
         self._poke()
         return True
@@ -146,14 +162,17 @@ class AudioSinkManager:
         with self._lock:
             video, self._video, self._track = self._video, None, None
             self._next = {}
-            self._engine.stop()
             if video is not None:
                 self._stopped(video, finished=False)
+            self._engine.stop()
         self._poke()
 
     def terminate(self):
         self.stop()
         self._engine.close()
+        # The worker is a daemon thread: without this the last stop report
+        # is lost at exit and the server shows the session playing for ever.
+        self._reporter.stop()
 
     # The mpv player's names for the same thing.
     stop_and_close = stop
@@ -243,11 +262,13 @@ class AudioSinkManager:
                 # The engine moved on by itself: follow it.
                 self._next.pop(previous, None)
                 if previous is not None:
-                    self._stopped(previous.key, finished=True)
+                    self._stopped(previous.key, finished=True, at_end=True)
                 self._video, self._track = track.key, track
+                self._started(track.key, 0.0)
             elif track is not self._track:
                 return                      # overtaken by a newer play()
-            self._started(track.key)
+            else:
+                self._started(track.key, self._start_offset)
         self._poke()
 
     def _on_finished(self, track):
@@ -257,7 +278,7 @@ class AudioSinkManager:
             video, self._video, self._track = self._video, None, None
             self._next = {}
             if video is not None:
-                self._stopped(video, finished=True)
+                self._stopped(video, finished=True, at_end=True)
         self._poke()
 
     def _on_error(self, track, error):
@@ -355,28 +376,112 @@ class AudioSinkManager:
             return []
         return [q.get("Id") for q in video.parent.queue if q.get("Id")]
 
-    # -- reporting: filled in by the next step --------------------------------
+    # -- reporting to the server ----------------------------------------------
 
-    def _started(self, video):
+    def _started(self, video, position):
         self._announced = video
-        self._report_started(video)
+        self._start_time = time.time()
+        self._last_position = position
+        self._report_started(video, position)
 
-    def _stopped(self, video, finished):
+    def _stopped(self, video, finished, at_end=False):
         # Only for an item that was announced: one paused or skipped before
         # any of it was heard never started, as far as the server knows.
-        if self._announced is video:
-            self._announced = None
-            self._report_stopped(video, finished)
+        if self._announced is not video:
+            return
+        self._announced = None
+        if at_end:
+            # It played out: say so with the full length, which is what
+            # makes the server count it as played.
+            position = video.get_duration() or self._last_position
+        else:
+            position = self._position_of(video)
+        self._report_stopped(video, finished, position)
+        if at_end and settings.force_set_played:
+            self._reporter.submit(lambda: video.set_played(True),
+                                  "item_played")
 
-    def _report_started(self, video):
-        """``video`` has become audible."""
+    def _position_of(self, video):
+        """Where ``video`` is, or was when the engine last had it."""
+        current = self._engine.current
+        if current is not None and current.key is video:
+            self._last_position = self._engine.position
+        return self._last_position
 
-    def _report_stopped(self, video, finished):
-        """``video`` is no longer playing; ``finished`` if it ran to its end
-        or was skipped past."""
+    def _options(self, video, position):
+        """The body of a playing / progress / stopped report, or None for an
+        item that never went through PlaybackInfo or has no server."""
+        if getattr(video, "client", None) is None \
+                or getattr(video, "playback_info", None) is None:
+            return None
+        aid = getattr(video, "aid", None)
+        return {
+            "VolumeLevel": self.get_volume(percent=True),
+            "IsMuted": self._engine.muted,
+            "IsPaused": self._engine.paused,
+            "RepeatMode": "RepeatNone",
+            "PositionTicks": int(position * TICKS),
+            "PlaybackStartTimeTicks": int(self._start_time * TICKS),
+            "SubtitleStreamIndex": -1,
+            "AudioStreamIndex": -1 if aid is None else aid,
+            "BufferedRanges": [],
+            "PlayMethod": "DirectPlay",
+            "PlaySessionId": video.playback_info["PlaySessionId"],
+            "PlaylistItemId": video.get_playlist_id(),
+            "MediaSourceId": video.media_source["Id"],
+            "CanSeek": True,
+            "ItemId": video.item_id,
+            "NowPlayingQueue": video.parent.queue,
+        }
+
+    def _report_started(self, video, position):
+        """``video`` has become audible, from ``position`` seconds in: open
+        its session on the server. The position is where playback began, not
+        a reading taken a moment later."""
+        self._session_ready.clear()
+        try:
+            options = self._options(video, position)
+        except Exception:
+            log.warning("Could not build the start report.", exc_info=True)
+            options = None
+        if options is None:
+            self._session_ready.set()
+            return
+
+        def playing():
+            try:
+                video.client.jellyfin.session_playing(options)
+            finally:
+                # Never left clear, even on failure, or progress reports
+                # would stall for the rest of the track.
+                self._session_ready.set()
+
+        self._reporter.submit(playing, "session_playing")
+
+    def _report_stopped(self, video, finished, position):
+        """``video`` is no longer playing, at ``position`` seconds.
+        ``finished``: it ran to its end or was skipped past."""
+        try:
+            options = self._options(video, position)
+        except Exception:
+            log.warning("Could not build the stop report.", exc_info=True)
+            return
+        if options is not None:
+            self._reporter.submit(
+                lambda: video.client.jellyfin.session_stop(options),
+                "session_stop")
 
     def send_timeline(self):
-        """Progress report; called by the timeline thread every few seconds."""
+        """Progress report. The timeline thread calls this every few seconds
+        and whenever something changes (pause, seek, volume)."""
+        with self._lock:
+            video = self._video
+            if video is None or self._announced is not video \
+                    or not self._session_ready.is_set():
+                return
+            options = self._options(video, self._position_of(video))
+        if options is not None:
+            video.client.jellyfin.session_progress(options)
 
     # -- parts of the mpv player's surface that mean nothing without a screen -
 
