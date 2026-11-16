@@ -45,6 +45,9 @@ systray = ["pystray"]
 # unknown extra is only a warning — the install would silently lack the tray.
 gui = ["pystray"]
 discord = ["pypresence"]
+# Gapless FLAC without mpv (jellyfin_mpv_shim/native_audio). sounddevice also
+# needs the PortAudio system library (libportaudio2 on Debian).
+sink = ["numpy", "soundfile", "sounddevice"]
 all = [
     "pystray",
     "pypresence",
