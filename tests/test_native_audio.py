@@ -21,7 +21,6 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))))
 
-import functools
 import http.server
 import os
 import tempfile
@@ -88,20 +87,45 @@ class FakeOutput:
         return np.concatenate(self._chunks)
 
 
-class _SlowHandler(http.server.SimpleHTTPRequestHandler):
-    """Serves files a little at a time, like a server further away."""
+class _SlowHandler(http.server.BaseHTTPRequestHandler):
+    """Serves files a little at a time, like a server further away, and
+    answers range requests the way Jellyfin does (206 + Content-Range)."""
+
+    directory = None
+    requests_seen = []                      # (path, Range header or None)
 
     def log_message(self, *args):
         pass
 
-    def copyfile(self, source, outputfile):
-        while True:
-            data = source.read(16384)
-            if not data:
-                break
-            outputfile.write(data)
-            outputfile.flush()
-            time.sleep(0.002)
+    def do_GET(self):
+        path = os.path.join(self.directory, self.path.lstrip("/"))
+        asked = self.headers.get("Range")
+        _SlowHandler.requests_seen.append((self.path, asked))
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        size, start = os.path.getsize(path), 0
+        if asked:
+            start = int(asked.split("=")[1].split("-")[0])
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (start, size - 1, size))
+        else:
+            self.send_response(200)
+        self.send_header("Content-Length", str(size - start))
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            try:
+                while True:
+                    data = f.read(16384)
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    time.sleep(0.002)
+            except (BrokenPipeError, ConnectionResetError):
+                pass                        # the player hung up: a seek
 
 
 @unittest.skipUnless(HAVE_DEPS, "needs numpy and soundfile (the sink extra)")
@@ -146,9 +170,10 @@ class NativeAudioTest(unittest.TestCase):
         return path, pcm
 
     def serve(self):
+        _SlowHandler.requests_seen = []
         srv = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            functools.partial(_SlowHandler, directory=self.dir))
+            type("Handler", (_SlowHandler,), {"directory": self.dir}))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
@@ -181,17 +206,56 @@ class NativeAudioTest(unittest.TestCase):
         (_, a), (_, b), (_, c) = (self.flac("1.flac"), self.flac("2.flac"),
                                   self.flac("3.flac"))
         base = self.serve()
-        cache = os.path.join(self.dir, "cache")
-        os.mkdir(cache)
-        self.play_all([Track(HttpSource(base + "%d.flac" % n,
-                                        cache_dir=cache), n)
-                       for n in (1, 2, 3)])
+        tracks = [Track(HttpSource(base + "%d.flac" % n), n)
+                  for n in (1, 2, 3)]
+        self.play_all(tracks)
         self.assertEqual(len(FakeOutput.opened), 1)
         np.testing.assert_array_equal(
             FakeOutput.opened[0].pcm,
             np.concatenate([a, b, c, self.tail(a)]))
         self.assertEqual([s[2] for s in self.started], [False, True, True])
-        self.assertEqual(os.listdir(cache), [], "downloads are cleaned up")
+        self.assertEqual([t.source.mode for t in tracks], ["ram"] * 3)
+        self.assertEqual([t.source._buf for t in tracks], [None] * 3,
+                         "memory is given back once a track has played")
+        self.assertEqual(sorted(os.listdir(self.dir)),
+                         ["1.flac", "2.flac", "3.flac"], "nothing on disk")
+
+    def test_a_track_over_the_limit_is_streamed_not_held(self):
+        (p1, a), (p2, b), (_, c) = (self.flac("1.flac"),
+                                    self.flac("2.flac", 20.0),
+                                    self.flac("3.flac"))
+        base = self.serve()
+        limit = os.path.getsize(p1) + 1000  # tracks 1 and 3 fit, 2 does not
+        tracks = [Track(HttpSource(base + "%d.flac" % n, ram_limit=limit), n)
+                  for n in (1, 2, 3)]
+        self.play_all(tracks)
+        self.assertEqual([t.source.mode for t in tracks],
+                         ["ram", "stream", "ram"])
+        self.assertIsNone(tracks[1].source._buf, "never held whole")
+        np.testing.assert_array_equal(
+            FakeOutput.opened[0].pcm,
+            np.concatenate([a, b, c, self.tail(a)]))
+        self.assertGreater(os.path.getsize(p2), 3 << 20,
+                           "big enough to outgrow the streaming window")
+
+    def test_seeking_a_streamed_track_asks_the_server_for_that_part(self):
+        path, a = self.flac("1.flac", 30.0)
+        base = self.serve()
+        self.order = [Track(HttpSource(base + "1.flac", ram_limit=1000))]
+        self.player.pause()
+        self.player.play(self.order[0])
+        self.player.pause()
+        self.player.seek(25.0)
+        self.player.resume()
+        self.assertTrue(self.finished.wait(20))
+        np.testing.assert_array_equal(
+            FakeOutput.opened[-1].pcm,
+            np.concatenate([a[25 * 44100:], self.tail(a)]))
+        ranged = [r for _, r in _SlowHandler.requests_seen if r]
+        self.assertTrue(ranged, "the seek should be a range request")
+        self.assertGreater(
+            max(int(r.split("=")[1].rstrip("-")) for r in ranged),
+            os.path.getsize(path) // 2)
 
     def test_24_bit_stays_integer(self):
         (p1, a), (p2, b) = (self.flac("1.flac", subtype="PCM_24"),
@@ -273,8 +337,7 @@ class NativeAudioTest(unittest.TestCase):
 
     def test_a_failed_download_is_reported_not_played(self):
         base = self.serve()
-        self.order = [Track(HttpSource(base + "missing.flac",
-                                       cache_dir=self.dir), "gone")]
+        self.order = [Track(HttpSource(base + "missing.flac"), "gone")]
         self.player.play(self.order[0])
         self.assertTrue(self.failed.wait(20), "no error reported")
         self.assertIsInstance(self.errors[0], FetchError)
@@ -284,7 +347,7 @@ class NativeAudioTest(unittest.TestCase):
     def test_reading_waits_for_bytes_that_have_not_arrived(self):
         path, _ = self.flac("1.flac", 3.0)
         base = self.serve()
-        src = HttpSource(base + "1.flac", cache_dir=self.dir)
+        src = HttpSource(base + "1.flac")
         with src.open() as f:
             size = f.seek(0, os.SEEK_END)
             self.assertEqual(size, os.path.getsize(path))
