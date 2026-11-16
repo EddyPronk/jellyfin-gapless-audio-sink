@@ -360,7 +360,7 @@ RESTART_REQUIRED = frozenset({
     "lang",
     # One-way doors: both change what the app is at startup rather than what
     # it is doing.
-    "enable_gui", "headless",
+    "enable_gui", "headless", "audio_sink",
     # player.py picks its backend at import time.
     "mpv_ext", "mpv_ext_path", "mpv_ext_ipc", "mpv_ext_start",
     "mpv_ext_no_ovr", "mpv_ext_start_retries", "mpv_ext_start_retry_delay_ms",

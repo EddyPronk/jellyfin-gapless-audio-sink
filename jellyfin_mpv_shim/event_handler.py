@@ -1,7 +1,7 @@
 import logging
 
 from .media import Media
-from .player import playerManager
+from .player_select import playerManager
 from .timeline import timelineManager
 
 log = logging.getLogger("event_handler")

@@ -614,9 +614,18 @@ then set `mpv_ext` and `mpv_ext_path` to use it.
 
 ### Native audio sink
 
-Gapless FLAC playback without mpv, for a machine that is only an audio output. The switch
-that turns it on is not in the app yet; these two settings are read by it. See
-[native-flac-plan.md](native-flac-plan.md).
+Gapless FLAC playback without mpv, for a machine that is only an audio output, such as a
+Raspberry Pi wired to a DAC. See [native-flac-plan.md](native-flac-plan.md).
+
+- `audio_sink` - Run as an audio output only. Default: `false`. Requires restart.
+  - Cast to it from another Jellyfin app. Consecutive tracks are joined with no gap.
+  - **FLAC only**, and only when the server hands the file over unmodified. Anything else
+    is refused and logged, and a queue stops before the first track it cannot play.
+  - There is no window, library or Settings, whatever `enable_gui` says, and mpv is not
+    loaded or needed. It advertises itself to the server as playing audio only.
+  - Needs the `sink` extra (`pip install jellyfin-mpv-shim[sink]`) and the PortAudio system
+    library (`libportaudio2` on Debian).
+  - Not supported: SyncPlay, repeat, shuffle, and formats other than FLAC.
 
 - `sink_device` - The output device, as PortAudio names it (for example `Schiit Modi+`, or
   `hw:1,0`). Default: `null` (the system default). `audio_device` is mpv's and does not apply.
