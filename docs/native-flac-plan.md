@@ -104,7 +104,7 @@ not import `python-mpv` at all, so the Pi needs no mpv installed.
    (`player_reporting.py`) reads `_player` for position and pause state, so either give it a
    thin object exposing those properties from the output stage or lift the report-building
    code out of the mixin. Decide after reading it in full.
-6. **Startup switch.** `mpv_shim.py` picks the manager from `audio_sink`; make
+6. **Startup switch.** Done, see "Step 6 results". Original description: `mpv_shim.py` picks the manager from `audio_sink`; make
    `event_handler.py` and `action_thread.py` resolve the singleton through one accessor
    instead of importing it from `player.py`.
 7. **Queue edits and transport.** Next/previous, skip-to, `PlayNext`/`PlayLast`, repeat and
@@ -398,6 +398,51 @@ stopped after about 7 s; why the server counted that was not looked into.
 Still open: "now playing" changes about 1.2 s before the new track is heard (it is sent
 when the track is handed to the device). The position reported is corrected for the device
 delay; the moment of the change is not.
+
+## Step 6 results (2026-11-16)
+
+`audio_sink: true` in `conf.json` makes the app an audio output: `player_select.py` hands
+out `AudioSinkManager` in place of the mpv player. The event handler, timeline thread and
+action thread import the player from there, so in sink mode `player.py`, and with it mpv,
+is never imported. With `audio_sink` off nothing changes.
+
+- **No window or library** in sink mode, whatever `enable_gui` says. MPRIS is skipped.
+- **Capabilities:** the server is told the client plays audio only and accepts transport,
+  volume and queue commands, not navigation or "display content".
+- `audio_sink` is listed as needing a restart, in the docs and the settings form's list.
+
+Tests: `tests/test_player_select.py` (2 tests, each in a fresh interpreter): in sink mode
+every module gets the same sink object and neither `player` nor `mpv` is loaded; by
+default it is still the mpv player.
+
+End to end on the Pi, three runs: the service stopped, the real app started from a scratch
+copy of the config with `audio_sink` on (`--config`), a cast of the two test tracks sent
+through the server's remote-control API, then the service started again.
+
+| Check | Result |
+|---|---|
+| Starts without mpv | "Audio sink mode" logged; `libmpv` not mapped in the process |
+| Session on the server | appears within 3 s, `PlayableMediaTypes: Audio` |
+| Cast with a start position | track 1 playing at 127.7 s, seven seconds after the cast |
+| Gapless advance | server shows track 2; DAC output bit-exact across the join |
+| Pause / unpause / stop from the server | each acted on; "paused" shown; nothing playing after stop |
+| Memory | 85 MB resident, against about 130 MB for the same app with mpv |
+| App log | no errors or tracebacks |
+
+Found by these runs and fixed: **a pause could be reported and then overwritten.** Two
+threads report progress on a pause, and a report built just before it could reach the
+server after the one built after it, so the server went on showing "playing". Progress is
+now built and sent under one lock, as the mpv player does (`d1115ead`, with a test that
+fails without it).
+
+Not done by these runs: the live `conf.json` on the Pi was not changed, so the service is
+still the mpv player. To switch it over, add `"audio_sink": true` to
+`~/.config/jellyfin-mpv-shim/conf.json` and restart the service (`sink_device` and
+`sink_ram_limit_mb` are already set there).
+
+A caution for anyone repeating the test: an app version that does not know a setting drops
+it from `conf.json` when it saves. The first attempt ran old code against the scratch
+config and silently removed `audio_sink` from it.
 
 ## Risks
 
