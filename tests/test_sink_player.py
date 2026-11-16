@@ -428,6 +428,40 @@ class AudioSinkManagerTest(SinkTestCase):
         self.wait_idle()
         self.assertTrue(self.pm.timeline_trigger.wait(5))
 
+    def test_a_dropout_is_logged_once_with_its_length(self):
+        media = self.queue("a", seconds=5.0)
+        self.pm.play(media.video)
+        self.wait_started("a")
+        self.pm.pause_if_playing()
+        time.sleep(0.05)
+        # The fake sound card is not paced, so it can outrun the decoder
+        # before the pause; take that as read.
+        self.pm.send_timeline()
+        with self.assertNoLogs("sink_player", level="WARNING"):
+            self.pm.send_timeline()
+        self.pm._engine.underrun_frames += RATE // 2     # half a second
+        with self.assertLogs("sink_player", level="WARNING") as logs:
+            self.pm.send_timeline()
+        self.assertIn("500 ms of silence", logs.output[0])
+        with self.assertNoLogs("sink_player", level="WARNING"):
+            self.pm.send_timeline()         # not repeated
+
+    def test_memory_is_only_locked_when_there_is_no_limit(self):
+        import resource
+        from jellyfin_mpv_shim import sink_player
+
+        with mock.patch.object(resource, "getrlimit",
+                               return_value=(8 << 20, 8 << 20)), \
+                mock.patch("ctypes.CDLL") as cdll:
+            self.assertFalse(sink_player.lock_memory())
+            cdll.assert_not_called()
+        with mock.patch.object(resource, "getrlimit", return_value=(
+                resource.RLIM_INFINITY, resource.RLIM_INFINITY)), \
+                mock.patch("ctypes.CDLL") as cdll:
+            cdll.return_value.mlockall.return_value = 0
+            self.assertTrue(sink_player.lock_memory())
+            cdll.return_value.mlockall.assert_called_once_with(7)
+
     def test_syncplay_is_declined(self):
         self.assertFalse(self.pm.syncplay.in_group())
         self.assertFalse(self.pm.syncplay.is_enabled())

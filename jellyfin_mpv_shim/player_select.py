@@ -11,8 +11,9 @@ to be loaded by then; ``mpv_shim.main`` loads them first.
 from .conf import settings
 
 if settings.audio_sink:
-    from .sink_player import AudioSinkManager
+    from .sink_player import AudioSinkManager, lock_memory
 
+    lock_memory()
     playerManager = AudioSinkManager()
     #: What a lost mpv raises. The sink has no mpv to lose.
     _mpv_errors = ()
