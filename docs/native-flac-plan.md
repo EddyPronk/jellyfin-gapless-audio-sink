@@ -99,7 +99,7 @@ not import `python-mpv` at all, so the Pi needs no mpv installed.
    current one plays, without `terminate_transcode()` or disturbing the current play session.
 4. **`AudioSinkManager`.** Done, see "Step 4 results". Original description: Owns the queue position, drives fetcher/decoder/output, and
    advances `Media` when the output crosses a track boundary (not when a download ends).
-5. **Server reporting.** At each boundary: stopped report for the old item, played mark,
+5. **Server reporting.** Done, see "Step 5 results". Original description: At each boundary: stopped report for the old item, played mark,
    start report for the new one; progress on the existing timeline tick. `ReportingMixin`
    (`player_reporting.py`) reads `_player` for position and pause state, so either give it a
    thin object exposing those properties from the output stage or lift the report-building
@@ -315,8 +315,7 @@ the sink manager has to cache what it resolved.
 
 `jellyfin_mpv_shim/sink_player.py`: `AudioSinkManager`, with the method names the event
 handler and timeline thread already call on the mpv player, driving the native engine. It
-does not import mpv. Nothing selects it yet (step 6), and it reports nothing to the server
-yet (step 5): `_report_started`, `_report_stopped` and `send_timeline` are empty hooks.
+does not import mpv. Nothing selects it yet (step 6). Server reporting was added in step 5.
 
 - **Cast commands covered:** play (with a start offset), stop, pause/unpause/toggle, seek
   (absolute and relative), next, previous, skip-to, volume, mute, and "play next / play
@@ -350,6 +349,55 @@ The running service was not touched.
 
 Seen in that run and relevant to step 5: "started" is reported about 1.2 s before the track
 is heard (the device buffer plus PortAudio's lead-in).
+
+## Step 5 results (2026-11-16)
+
+`AudioSinkManager` now tells the server what is playing, with the same three reports and
+the same body as the mpv player (`session_playing`, `session_progress`, `session_stop`).
+The code is its own, in `sink_player.py`, not `ReportingMixin`: that mixin reads mpv
+properties throughout. It reuses `SessionReporter`, the app's ordered report queue, so a
+stop cannot overtake the start that follows it and no report sits between two tracks.
+
+| When | Report | Position sent |
+|---|---|---|
+| A cast starts and is first handed to the device | playing | the offset the cast asked for |
+| Gapless advance | stop for the old track, then playing for the new | old: its full length; new: 0 |
+| Every timeline tick, and on pause / seek / volume | progress | as heard (device delay removed) |
+| Stop, or replaced by another cast | stop | where it was |
+| Next / previous / skip-to | stop | where it was, not the full length |
+| The queue runs out | stop | full length |
+
+- **Played marks:** a track that plays out is reported at its full length, which is what
+  makes the server count it. With `force_set_played` on, an explicit mark follows the stop
+  on the same queue. A track stopped or skipped part-way is never marked.
+- **Progress waits for the start.** No progress report is sent until the server has been
+  told the track started.
+- **A failing server does not stop the music.** Start and stop reports run on the report
+  queue, which swallows failures. Progress is sent on the caller's thread, as the mpv
+  player's is, and the timeline thread absorbs a failure there.
+- **Quitting delivers the last stop**: `terminate()` drains the queue.
+- **Not carried over from the mpv player:** the offline catalog mirror, Discord presence,
+  and the browser's "stopped at" callback. None applies to a headless sink.
+
+Tests: `tests/test_sink_player.py` is now 27 tests; the ten new ones run against a stand-in
+server that records every report. 25 consecutive runs passed.
+
+Checked on the Pi against the real server, reading the session back from `/Sessions`:
+
+| Moment | Server showed |
+|---|---|
+| During track 1 | track 1, 126.3 s, not paused, volume 10 |
+| Just after the join | track 2, 0.3 s |
+| 4 s later | track 2, 5.0 s |
+| After a pause | paused |
+| After stop | nothing playing |
+
+Track 1's play count went from 3 to 4. Track 2's also went up by one although it was
+stopped after about 7 s; why the server counted that was not looked into.
+
+Still open: "now playing" changes about 1.2 s before the new track is heard (it is sent
+when the track is handed to the device). The position reported is corrected for the device
+delay; the moment of the change is not.
 
 ## Risks
 

@@ -47,25 +47,80 @@ RATE = 44100
 
 
 class FakeVideo:
+    client = None                           # no server: nothing is reported
+    playback_info = None
+
     def __init__(self, parent, entry):
         self.parent = parent
         self.item_id = entry["Id"]
 
+    def get_duration(self):
+        return None
+
     def __repr__(self):
         return "Video(%s)" % self.item_id
+
+
+class Server:
+    """``client.jellyfin``: keeps every report it is sent, in order."""
+
+    def __init__(self):
+        self.calls = []
+        self.failing = set()
+
+    def _record(self, kind, options):
+        self.calls.append((kind, dict(options)))
+        if kind in self.failing:
+            raise RuntimeError("the server is unreachable")
+
+    def session_playing(self, options):
+        self._record("playing", options)
+
+    def session_progress(self, options):
+        self._record("progress", options)
+
+    def session_stop(self, options):
+        self._record("stop", options)
+
+    def kinds(self):
+        return [(kind, o["ItemId"]) for kind, o in self.calls]
+
+
+class ServerVideo(FakeVideo):
+    """A Video that went through PlaybackInfo on a server."""
+
+    server = None
+    durations = {}
+
+    def __init__(self, parent, entry):
+        super().__init__(parent, entry)
+        self.client = type("Client", (), {"jellyfin": self.server})
+        self.playback_info = {"PlaySessionId": "session-" + self.item_id}
+        self.media_source = {"Id": "source-" + self.item_id}
+        self.aid = None
+
+    def get_duration(self):
+        return self.durations.get(self.item_id)
+
+    def get_playlist_id(self):
+        return "playlist-" + self.item_id
+
+    def set_played(self, watched=True):
+        self.server.calls.append(("played", {"ItemId": self.item_id}))
 
 
 class FakeMedia:
     """``Media``: a queue, a position in it, and the Video at that position."""
 
     built = 0                               # Videos built, i.e. requests made
+    video_class = FakeVideo
 
     def __init__(self, queue, seq=0):
         self.queue, self.seq = queue, seq
         self.has_next = seq < len(queue) - 1
         self.has_prev = seq > 0
         FakeMedia.built += 1
-        self.video = FakeVideo(self, queue[seq])
+        self.video = self.video_class(self, queue[seq])
 
     def get_next(self):
         return FakeMedia(self.queue, self.seq + 1) if self.has_next else None
@@ -94,23 +149,27 @@ class Recording(AudioSinkManager):
 
     def __init__(self, *args, **kwargs):
         self.reports = []
+        self.positions = []
         self.idle = threading.Event()
         super().__init__(*args, **kwargs)
 
-    def _report_started(self, video):
+    def _report_started(self, video, position):
         self.reports.append(("started", video.item_id))
 
-    def _report_stopped(self, video, finished):
+    def _report_stopped(self, video, finished, position):
+        self.positions.append(position)
         self.reports.append(("stopped", video.item_id, finished))
         if self._video is None:
             self.idle.set()
 
 
-@unittest.skipUnless(HAVE_DEPS, "needs numpy and soundfile (the sink extra)")
-class AudioSinkManagerTest(unittest.TestCase):
+class SinkTestCase(unittest.TestCase):
+    manager = None                          # set by each test class
+
     def setUp(self):
         FakeOutput.opened = []
         FakeMedia.built = 0
+        FakeMedia.video_class = FakeVideo
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.rng = np.random.default_rng(2)
@@ -118,7 +177,8 @@ class AudioSinkManagerTest(unittest.TestCase):
         self.not_flac = set()
         self.resolved = []
         self.limits = []
-        self.pm = Recording(resolve=self.resolve, output_factory=FakeOutput)
+        self.pm = self.manager(resolve=self.resolve,
+                               output_factory=FakeOutput)
         self.addCleanup(self.pm.terminate)
 
     def track_file(self, name, seconds=1.0):
@@ -160,6 +220,16 @@ class AudioSinkManagerTest(unittest.TestCase):
         np.testing.assert_array_equal(
             self.heard(), np.concatenate(list(parts) + [tail]))
 
+
+
+@unittest.skipUnless(HAVE_DEPS, "needs numpy and soundfile (the sink extra)")
+class AudioSinkManagerTest(SinkTestCase):
+    manager = None
+
+    def setUp(self):
+        AudioSinkManagerTest.manager = Recording
+        super().setUp()
+
     # -- a cast album ---------------------------------------------------------
 
     def test_a_queue_plays_through_gaplessly_and_the_current_item_follows(self):
@@ -191,9 +261,9 @@ class AudioSinkManagerTest(unittest.TestCase):
         media = self.queue("a", "b", seconds=2.0)
         seen = []
         started = self.pm._report_started
-        self.pm._report_started = lambda video: (
+        self.pm._report_started = lambda video, position: (
             seen.append((video.item_id, self.pm.get_video().item_id)),
-            started(video))
+            started(video, position))
         self.pm.play(media.video)
         self.wait_idle()
         self.assertEqual(seen, [("a", "a"), ("b", "b")])
@@ -363,6 +433,148 @@ class AudioSinkManagerTest(unittest.TestCase):
         self.assertFalse(self.pm.syncplay.is_enabled())
         self.pm.syncplay.process_group_update({})
         self.pm.syncplay.process_command({})
+
+
+@unittest.skipUnless(HAVE_DEPS, "needs numpy and soundfile (the sink extra)")
+class ReportingTest(SinkTestCase):
+    """What the server is told, and in what order."""
+
+    def setUp(self):
+        ReportingTest.manager = AudioSinkManager
+        super().setUp()
+        self.server = Server()
+        ServerVideo.server = self.server
+        ServerVideo.durations = {}
+        FakeMedia.video_class = ServerVideo
+
+    def queue(self, *names, seconds=1.0):
+        media = super().queue(*names, seconds=seconds)
+        for name in names:
+            ServerVideo.durations[name] = len(self.pcm[name]) / RATE
+        return media
+
+    def wait_for(self, kind, name, timeout=10):
+        deadline = time.monotonic() + timeout
+        while (kind, name) not in self.server.kinds():
+            self.assertLess(time.monotonic(), deadline,
+                            "no %s report for %s: %s"
+                            % (kind, name, self.server.kinds()))
+            time.sleep(0.005)
+
+    def test_a_queue_is_reported_start_to_finish_in_order(self):
+        media = self.queue("a", "b", seconds=1.5)
+        self.pm.play(media.video)
+        self.wait_for("stop", "b")
+        self.assertEqual(self.server.kinds(), [
+            ("playing", "a"), ("stop", "a"), ("playing", "b"), ("stop", "b")])
+        playing, stop = self.server.calls[0][1], self.server.calls[1][1]
+        self.assertEqual(playing["PositionTicks"], 0)
+        self.assertEqual(stop["PositionTicks"], 15000000,
+                         "played out: the whole length, so it counts as "
+                         "played")
+        for options in (playing, stop):
+            self.assertEqual(options["ItemId"], "a")
+            self.assertEqual(options["PlaySessionId"], "session-a")
+            self.assertEqual(options["MediaSourceId"], "source-a")
+            self.assertEqual(options["PlaylistItemId"], "playlist-a")
+            self.assertEqual(options["PlayMethod"], "DirectPlay")
+            self.assertEqual(options["NowPlayingQueue"],
+                             [{"Id": "a"}, {"Id": "b"}])
+        self.assertEqual(self.server.calls[2][1]["PlaySessionId"],
+                         "session-b")
+
+    def test_a_cast_with_a_start_position_reports_it(self):
+        media = self.queue("a", seconds=5.0)
+        self.pm.play(media.video, 3.5)
+        self.wait_for("playing", "a")
+        self.assertEqual(self.server.calls[0][1]["PositionTicks"], 35000000)
+
+    def test_a_stop_part_way_reports_where_it_was(self):
+        media = self.queue("a", seconds=5.0)
+        self.pm.play(media.video)
+        self.wait_for("playing", "a")
+        self.pm.pause_if_playing()
+        self.pm.seek(2.0, absolute=True)
+        self.pm.stop()
+        self.pm._reporter.drain()
+        kind, options = self.server.calls[-1]
+        self.assertEqual(kind, "stop")
+        self.assertEqual(options["PositionTicks"], 20000000)
+        self.assertTrue(options["IsPaused"])
+
+    def test_skipping_reports_the_position_not_the_whole_length(self):
+        media = self.queue("a", "b", seconds=5.0)
+        self.pm.play(media.video)
+        self.wait_for("playing", "a")
+        self.pm.pause_if_playing()
+        self.pm.seek(1.0, absolute=True)
+        self.pm.play_next()
+        self.pm._reporter.drain()
+        stop = dict(self.server.calls)["stop"]
+        self.assertEqual(stop["ItemId"], "a")
+        self.assertEqual(stop["PositionTicks"], 10000000)
+
+    def test_progress_carries_position_pause_volume_and_mute(self):
+        media = self.queue("a", seconds=5.0)
+        self.pm.play(media.video)
+        self.wait_for("playing", "a")
+        self.pm.pause_if_playing()
+        self.pm.seek(3.0, absolute=True)
+        self.pm.set_volume(40)
+        self.pm.set_mute(True)
+        self.pm.send_timeline()
+        kind, options = self.server.calls[-1]
+        self.assertEqual(kind, "progress")
+        self.assertEqual(options["PositionTicks"], 30000000)
+        self.assertTrue(options["IsPaused"])
+        self.assertEqual(options["VolumeLevel"], 40)
+        self.assertTrue(options["IsMuted"])
+
+    def test_no_progress_before_the_start_has_been_reported(self):
+        media = self.queue("a", seconds=5.0)
+        self.pm.send_timeline()             # nothing playing
+        self.pm.pause_if_playing()
+        self.pm.play(media.video)
+        self.pm.pause_if_playing()          # held before a sample is out
+        self.pm.send_timeline()
+        self.assertEqual(self.server.calls, [])
+
+    def test_played_out_tracks_are_marked_played_only_when_asked(self):
+        media = self.queue("a", "b")
+        with mock.patch.object(settings, "force_set_played", True):
+            self.pm.play(media.video)
+            self.wait_for("stop", "b")
+            self.pm._reporter.drain()
+        self.assertEqual(self.server.kinds(), [
+            ("playing", "a"), ("stop", "a"), ("played", "a"),
+            ("playing", "b"), ("stop", "b"), ("played", "b")])
+
+    def test_a_stopped_track_is_not_marked_played(self):
+        media = self.queue("a", seconds=5.0)
+        with mock.patch.object(settings, "force_set_played", True):
+            self.pm.play(media.video)
+            self.wait_for("playing", "a")
+            self.pm.stop()
+            self.pm._reporter.drain()
+        self.assertNotIn(("played", "a"), self.server.kinds())
+
+    def test_an_unreachable_server_does_not_stop_the_music(self):
+        self.server.failing = {"playing", "stop", "progress"}
+        media = self.queue("a", "b")
+        self.pm.play(media.video)
+        self.wait_for("stop", "b")
+        self.expect(self.pcm["a"], self.pcm["b"])
+        with self.assertRaises(RuntimeError):
+            # Progress is sent on the caller's thread, as the mpv player's
+            # is; the timeline thread is what absorbs the failure.
+            self.server.session_progress({"ItemId": "x"})
+
+    def test_quitting_delivers_the_last_stop(self):
+        media = self.queue("a", seconds=5.0)
+        self.pm.play(media.video)
+        self.wait_for("playing", "a")
+        self.pm.terminate()
+        self.assertEqual(self.server.kinds()[-1], ("stop", "a"))
 
 
 if __name__ == "__main__":
