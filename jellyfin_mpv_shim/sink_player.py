@@ -78,6 +78,7 @@ class AudioSinkManager:
         #: Set once the server has been told playback started; progress
         #: reports wait for it, so one cannot arrive before the start.
         self._session_ready = threading.Event()
+        self._progress_lock = threading.Lock()
         self._start_time = time.time()
         self._last_position = 0.0
         self._start_offset = 0.0            # where the last play() began
@@ -474,17 +475,23 @@ class AudioSinkManager:
     def send_timeline(self):
         """Progress report. The timeline thread calls this every few seconds
         and whenever something changes (pause, seek, volume)."""
-        with self._lock:
-            video = self._video
-            if video is None or self._announced is not video \
-                    or not self._session_ready.is_set():
-                return
-            options = self._options(video, self._position_of(video))
-        if options is not None:
-            log.debug("progress: %.1fs paused=%s volume=%s",
-                      options["PositionTicks"] / TICKS, options["IsPaused"],
-                      options["VolumeLevel"])
-            video.client.jellyfin.session_progress(options)
+        # One report at a time, built and sent under the same lock. Two
+        # threads report on a pause (the command's handler and the timeline
+        # thread it wakes); without this a report built just BEFORE the
+        # pause could reach the server after the one built after it, and
+        # the server would show "playing" until the next tick.
+        with self._progress_lock:
+            with self._lock:
+                video = self._video
+                if video is None or self._announced is not video \
+                        or not self._session_ready.is_set():
+                    return
+                options = self._options(video, self._position_of(video))
+            if options is not None:
+                log.debug("progress: %.1fs paused=%s volume=%s",
+                          options["PositionTicks"] / TICKS,
+                          options["IsPaused"], options["VolumeLevel"])
+                video.client.jellyfin.session_progress(options)
 
     # -- parts of the mpv player's surface that mean nothing without a screen -
 

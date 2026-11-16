@@ -530,6 +530,40 @@ class ReportingTest(SinkTestCase):
         self.assertEqual(options["VolumeLevel"], 40)
         self.assertTrue(options["IsMuted"])
 
+    def test_progress_reports_reach_the_server_in_the_order_they_were_built(
+            self):
+        # A pause is reported from two threads at once. If the reports could
+        # overlap, one built before the pause could land after one built
+        # after it, and the server would go on showing "playing".
+        media = self.queue("a", seconds=5.0)
+        self.pm.play(media.video)
+        self.wait_for("playing", "a")
+        inside, overlapped, arrived = [0], [], []
+        first_in, release = threading.Event(), threading.Event()
+
+        def slow_progress(options):
+            inside[0] += 1
+            overlapped.append(inside[0] > 1)
+            if not first_in.is_set():
+                first_in.set()
+                release.wait(5)             # a slow round trip
+            arrived.append(options["IsPaused"])
+            inside[0] -= 1
+
+        self.server.session_progress = slow_progress
+        early = threading.Thread(target=self.pm.send_timeline)
+        early.start()                       # built while still playing
+        self.assertTrue(first_in.wait(5))
+        self.pm.pause_if_playing()
+        late = threading.Thread(target=self.pm.send_timeline)
+        late.start()                        # built after the pause
+        time.sleep(0.2)
+        release.set()
+        early.join(5)
+        late.join(5)
+        self.assertEqual(arrived, [False, True])
+        self.assertNotIn(True, overlapped)
+
     def test_no_progress_before_the_start_has_been_reported(self):
         media = self.queue("a", seconds=5.0)
         self.pm.send_timeline()             # nothing playing
